@@ -267,13 +267,24 @@ pub fn main() !void {
     try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
     try vx.setMouseMode(tty.writer(), true);
 
+    // Pass args to allow switching wad files, e.g. `terminal-doom -iwad PLUTONIA.WAD`
     const args = try std.process.argsAlloc(alloc);
+    defer alloc.free(args);
+    const args_c = try argsC(alloc, args);
+    defer alloc.free(args_c);
 
     // Initialize Doom-generic and enter the game loop
-    doomgeneric_Create(@intCast(args.len), @ptrCast(args.ptr));
+    doomgeneric_Create(@intCast(args.len), args_c.ptr);
     while (state.exit_flag.load(.seq_cst) == false) {
         doomgeneric_Tick();
     }
+}
+
+fn argsC(allocator: std.mem.Allocator, args: []const [:0]u8) ![][*c]u8 {
+    const buf = try allocator.alloc([*c]u8, args.len + 1);
+    for (args, 0..) |arg, i| buf[i] = arg.ptr;
+    buf[args.len] = null;
+    return buf;
 }
 
 // Doomgeneric provides the screen buffer which we render when `DG_DrawFrame` is called.
