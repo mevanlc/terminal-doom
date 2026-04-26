@@ -112,15 +112,15 @@ pub fn build(b: *std.Build) void {
     const sourcefiles_sound = [_][]const u8{"src/miniaudio/doom_miniaudio_sound_bridge.c"};
 
     inline for (sourcefiles) |src| {
-        doom.addCSourceFile(.{ .file = b.path(src), .flags = &cflags });
+        doom.root_module.addCSourceFile(.{ .file = b.path(src), .flags = &cflags });
     }
 
     if (sound) {
         inline for (sourcefiles_sound) |src| {
-            doom.addCSourceFile(.{ .file = b.path(src), .flags = &cflags });
+            doom.root_module.addCSourceFile(.{ .file = b.path(src), .flags = &cflags });
         }
     }
 
-    doom.linkLibC();
+    doom.root_module.link_libc = true;
     b.installArtifact(doom);
 }

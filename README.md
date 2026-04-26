@@ -8,7 +8,7 @@ Demo with sound:
 [![Demo]](https://github.com/user-attachments/assets/8ca127d7-23f6-45cd-82e9-49c51c4cdc42)
 
 ## Building
-There are no system dependencies. Just clone and build with Zig v0.15.2:
+There are no system dependencies. Just clone and build with Zig v0.16:
 
 `zig build -Doptimize=ReleaseFast`
 

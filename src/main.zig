@@ -56,7 +56,7 @@ pub export fn DG_DrawFrame() callconv(.c) void {
     // We need to have a window size before continuing
     const win = state.loop.vaxis.window();
     if (win.screen.width == 0) {
-        while (state.loop.tryEvent()) |event| {
+        while (state.loop.tryEvent() catch null) |event| {
             switch (event) {
                 .winsize => |ws| state.loop.vaxis.resize(std.heap.c_allocator, state.loop.tty.writer(), ws) catch unreachable,
                 else => {},
@@ -120,7 +120,7 @@ pub export fn DG_DrawFrame() callconv(.c) void {
         img.draw(win, .{}) catch unreachable;
     }
 
-    while (state.loop.tryEvent()) |event| {
+    while (state.loop.tryEvent() catch null) |event| {
         switch (event) {
             .key_press, .key_release => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
@@ -188,12 +188,15 @@ fn accelerateMouse(delta: c_int, clamp: f32) c_int {
 
 /// Called by Doom when it needs to sleep
 pub export fn DG_SleepMs(ms: c_uint) callconv(.c) void {
-    std.Thread.sleep(ms * std.time.ns_per_ms);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
 }
 
 /// Called by Doom to get milliseconds passed since startup
 pub export fn DG_GetTicksMs() callconv(.c) u32 {
-    return @intCast(std.time.milliTimestamp() - state.startup);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = std.Io.Timestamp.now(io, .awake);
+    return @intCast(now.toMilliseconds() - state.startup);
 }
 
 /// Called by Doom to pull a keypress from the queue. Returns 0 if the queue is empty.
@@ -228,63 +231,49 @@ fn translateDoomBufferToRGB() void {
 
 /// Sets up libvaxis for terminal- and keyboard handling. Finally it
 /// enters the Doom game-loop.
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     // Use the C allocator for speed
     const alloc = std.heap.c_allocator;
-    const envmap = try std.process.getEnvMap(alloc);
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-    const stderr = &stderr_writer.interface;
-    if (envmap.get("TMUX")) |_| {
-        try stderr.print("Terminal Doom can not run under tmux\n", .{});
+    if (init.environ_map.get("TMUX") != null) {
+        std.debug.print("Terminal Doom can not run under tmux\n", .{});
         std.process.exit(1);
     }
 
     var tty_buffer: [1024]u8 = undefined;
-    var tty = try vaxis.Tty.init(&tty_buffer);
+    var tty = try vaxis.Tty.init(io, &tty_buffer);
     defer tty.deinit();
 
-    var vx = try vaxis.init(alloc, .{ .kitty_keyboard_flags = .{ .report_events = true } });
+    var vx = try vaxis.init(io, alloc, init.environ_map, .{ .kitty_keyboard_flags = .{ .report_events = true } });
     defer vx.deinit(alloc, tty.writer());
 
+    const now = std.Io.Timestamp.now(io, .awake);
     state = .{
         .key_queue = [_]u16{0} ** 32,
         .key_queue_write_idx = 0,
         .key_queue_read_idx = 0,
-        .startup = std.time.milliTimestamp(),
+        .startup = now.toMilliseconds(),
         .exit_flag = std.atomic.Value(bool).init(false),
-        .loop = .{
-            .tty = &tty,
-            .vaxis = &vx,
-        },
+        .loop = .init(io, &tty, &vx),
     };
 
-    try state.loop.init();
     try state.loop.start();
     defer state.loop.stop();
 
     try vx.enterAltScreen(tty.writer());
-    try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
+    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     try vx.setMouseMode(tty.writer(), true);
 
     // Pass args to allow switching wad files, e.g. `terminal-doom -iwad PLUTONIA.WAD`
-    const args = try std.process.argsAlloc(alloc);
-    defer alloc.free(args);
-    const args_c = try argsC(alloc, args);
-    defer alloc.free(args_c);
+    const args = init.minimal.args.vector;
+    const args_c: [*c][*c]u8 = @ptrCast(@constCast(args));
 
     // Initialize Doom-generic and enter the game loop
-    doomgeneric_Create(@intCast(args.len), args_c.ptr);
+    doomgeneric_Create(@intCast(args.len), args_c);
     while (state.exit_flag.load(.seq_cst) == false) {
         doomgeneric_Tick();
     }
-}
-
-fn argsC(allocator: std.mem.Allocator, args: []const [:0]u8) ![][*c]u8 {
-    const buf = try allocator.alloc([*c]u8, args.len + 1);
-    for (args, 0..) |arg, i| buf[i] = arg.ptr;
-    buf[args.len] = null;
-    return buf;
 }
 
 // Doomgeneric provides the screen buffer which we render when `DG_DrawFrame` is called.
