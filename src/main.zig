@@ -19,6 +19,8 @@ const State = struct {
     key_queue: [32]u16,
     key_queue_write_idx: u5,
     key_queue_read_idx: u5,
+    shared_key_source_down: [shared_source_count]bool = [_]bool{false} ** shared_source_count,
+    shared_key_alias_count: [shared_alias_count]u8 = [_]u8{0} ** shared_alias_count,
     startup: i64,
     loop: vaxis.Loop(Event),
     exit_flag: std.atomic.Value(bool),
@@ -26,6 +28,7 @@ const State = struct {
     last_mouse_x: f32 = std.math.floatMax(f32),
     last_mouse_y: f32 = std.math.floatMax(f32),
     mouse_dir: u21 = 0,
+    debug_key_events: bool = false,
     scale: bool = true,
 };
 
@@ -248,12 +251,15 @@ pub fn main(init: std.process.Init) !void {
     var vx = try vaxis.init(io, alloc, init.environ_map, .{ .kitty_keyboard_flags = .{ .report_events = true } });
     defer vx.deinit(alloc, tty.writer());
 
+    const debug_key_events = if (init.environ_map.get("TERMINAL_DOOM_KEY_DEBUG")) |raw| raw.len > 0 and (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "True") or std.mem.eql(u8, raw, "TRUE")) else false;
+
     const now = std.Io.Timestamp.now(io, .awake);
     state = .{
         .key_queue = [_]u16{0} ** 32,
         .key_queue_write_idx = 0,
         .key_queue_read_idx = 0,
         .startup = now.toMilliseconds(),
+        .debug_key_events = debug_key_events,
         .exit_flag = std.atomic.Value(bool).init(false),
         .loop = .init(io, &tty, &vx),
     };
@@ -287,36 +293,141 @@ const doom_width: usize = 640;
 const doom_height: usize = 400;
 const doom_frame_buffer_size: usize = doom_width * doom_height * 3;
 
-/// Map from codepoints to Doom keys
-fn enqueueKey(pressed: bool, key: vaxis.Key) void {
-    const doom_key: u8 = switch (key.codepoint) {
-        Key.enter => KEY_ENTER,
-        Key.escape => KEY_ESCAPE,
-        Key.left, 'j' => KEY_LEFTARROW,
-        Key.right, 'l' => KEY_RIGHTARROW,
-        Key.up, 'w' => KEY_UPARROW,
-        Key.down, 'k', 's' => KEY_DOWNARROW,
-        Key.left_control, Key.right_control, 'f', 'i' => KEY_FIRE,
-        Key.space => KEY_USE,
-        Key.left_alt, Key.right_alt => KEY_LALT,
-        Key.left_shift, Key.right_shift => KEY_RSHIFT,
-        Key.f2 => KEY_F2,
-        Key.f3 => KEY_F3,
-        Key.f4 => KEY_F4,
-        Key.f5 => KEY_F5,
-        Key.f6 => KEY_F6,
-        Key.f7 => KEY_F7,
-        Key.f8 => KEY_F8,
-        Key.f9 => KEY_F9,
-        Key.f10 => KEY_F10,
-        Key.f11 => KEY_F11,
-        Key.kp_equal, '=', '+' => KEY_EQUALS,
-        '-' => KEY_MINUS,
-        'a' => KEY_STRAFE_L,
-        'd' => KEY_STRAFE_R,
-        else => std.ascii.toLower(@intCast(key.codepoint)),
-    };
+const SharedAlias = enum(u8) {
+    none = 0,
+    forward = 1,
+    backward = 2,
+    left = 3,
+    right = 4,
+    fire = 5,
+};
 
+const shared_alias_count: usize = @intFromEnum(SharedAlias.fire) + 1;
+
+const SharedSource = enum(u8) {
+    none = 0,
+    forward_w = 1,
+    forward_up = 2,
+    backward_down = 3,
+    backward_k = 4,
+    backward_s = 5,
+    left_left = 6,
+    left_j = 7,
+    right_right = 8,
+    right_l = 9,
+    fire_lctrl = 10,
+    fire_rctrl = 11,
+    fire_f = 12,
+    fire_i = 13,
+};
+
+const shared_source_count: usize = @intFromEnum(SharedSource.fire_i) + 1;
+
+/// Map from codepoints to Doom keys
+const SharedKeyMap = struct {
+    doom_key: u8,
+    shared_alias: SharedAlias,
+    source: SharedSource,
+};
+
+fn enqueueKey(pressed: bool, key: vaxis.Key) void {
+    const mapped_key = mapSharedKey(key);
+    const doom_key = mapped_key.doom_key;
+    const alias_idx = @intFromEnum(mapped_key.shared_alias);
+    const source_idx = @intFromEnum(mapped_key.source);
+    const alias_count_before = if (alias_idx < shared_alias_count) state.shared_key_alias_count[alias_idx] else 0;
+    const source_down_before = if (source_idx < shared_source_count) state.shared_key_source_down[source_idx] else false;
+
+    if (state.debug_key_events) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var debug_buffer: [256]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &debug_buffer);
+        stdout.interface.print("key_codepoint={} pressed={} doom_key=0x{x:0>2} alias={} source={} alias_count_before={} source_down_before={}\n", .{
+            key.codepoint,
+            pressed,
+            doom_key,
+            @intFromEnum(mapped_key.shared_alias),
+            @intFromEnum(mapped_key.source),
+            alias_count_before,
+            source_down_before,
+        }) catch {};
+    }
+
+    if (mapped_key.shared_alias == .none or mapped_key.source == .none) {
+        queueDoomKey(pressed, doom_key);
+        return;
+    }
+
+    if (pressed) {
+        if (!state.shared_key_source_down[source_idx]) {
+            if (state.shared_key_alias_count[alias_idx] == 0) {
+                queueDoomKey(pressed, doom_key);
+            }
+            if (state.shared_key_alias_count[alias_idx] < std.math.maxInt(u8)) {
+                state.shared_key_alias_count[alias_idx] += 1;
+            }
+            state.shared_key_source_down[source_idx] = true;
+        }
+        return;
+    }
+
+    if (state.shared_key_alias_count[alias_idx] > 0) {
+        state.shared_key_alias_count[alias_idx] -= 1;
+        state.shared_key_source_down[source_idx] = false;
+        if (state.shared_key_alias_count[alias_idx] == 0) {
+            queueDoomKey(pressed, doom_key);
+        }
+        return;
+    }
+
+    if (state.shared_key_source_down[source_idx]) {
+        state.shared_key_source_down[source_idx] = false;
+        queueDoomKey(pressed, doom_key);
+        return;
+    }
+
+    queueDoomKey(pressed, doom_key);
+}
+
+fn mapSharedKey(key: vaxis.Key) SharedKeyMap {
+    return switch (key.codepoint) {
+        Key.enter => .{ .doom_key = KEY_ENTER, .shared_alias = .none, .source = .none },
+        Key.escape => .{ .doom_key = KEY_ESCAPE, .shared_alias = .none, .source = .none },
+        Key.left => .{ .doom_key = KEY_LEFTARROW, .shared_alias = .left, .source = .left_left },
+        'j' => .{ .doom_key = KEY_LEFTARROW, .shared_alias = .left, .source = .left_j },
+        Key.right => .{ .doom_key = KEY_RIGHTARROW, .shared_alias = .right, .source = .right_right },
+        'l' => .{ .doom_key = KEY_RIGHTARROW, .shared_alias = .right, .source = .right_l },
+        Key.up => .{ .doom_key = KEY_UPARROW, .shared_alias = .forward, .source = .forward_up },
+        'w' => .{ .doom_key = KEY_UPARROW, .shared_alias = .forward, .source = .forward_w },
+        Key.down => .{ .doom_key = KEY_DOWNARROW, .shared_alias = .backward, .source = .backward_down },
+        'k' => .{ .doom_key = KEY_DOWNARROW, .shared_alias = .backward, .source = .backward_k },
+        's' => .{ .doom_key = KEY_DOWNARROW, .shared_alias = .backward, .source = .backward_s },
+        Key.left_control => .{ .doom_key = KEY_FIRE, .shared_alias = .fire, .source = .fire_lctrl },
+        Key.right_control => .{ .doom_key = KEY_FIRE, .shared_alias = .fire, .source = .fire_rctrl },
+        'f' => .{ .doom_key = KEY_FIRE, .shared_alias = .fire, .source = .fire_f },
+        'i' => .{ .doom_key = KEY_FIRE, .shared_alias = .fire, .source = .fire_i },
+        Key.space => .{ .doom_key = KEY_USE, .shared_alias = .none, .source = .none },
+        Key.left_alt, Key.right_alt => .{ .doom_key = KEY_LALT, .shared_alias = .none, .source = .none },
+        Key.left_shift, Key.right_shift => .{ .doom_key = KEY_RSHIFT, .shared_alias = .none, .source = .none },
+        Key.f2 => .{ .doom_key = KEY_F2, .shared_alias = .none, .source = .none },
+        Key.f3 => .{ .doom_key = KEY_F3, .shared_alias = .none, .source = .none },
+        Key.f4 => .{ .doom_key = KEY_F4, .shared_alias = .none, .source = .none },
+        Key.f5 => .{ .doom_key = KEY_F5, .shared_alias = .none, .source = .none },
+        Key.f6 => .{ .doom_key = KEY_F6, .shared_alias = .none, .source = .none },
+        Key.f7 => .{ .doom_key = KEY_F7, .shared_alias = .none, .source = .none },
+        Key.f8 => .{ .doom_key = KEY_F8, .shared_alias = .none, .source = .none },
+        Key.f9 => .{ .doom_key = KEY_F9, .shared_alias = .none, .source = .none },
+        Key.f10 => .{ .doom_key = KEY_F10, .shared_alias = .none, .source = .none },
+        Key.f11 => .{ .doom_key = KEY_F11, .shared_alias = .none, .source = .none },
+        Key.kp_equal, '=', '+' => .{ .doom_key = KEY_EQUALS, .shared_alias = .none, .source = .none },
+        '-' => .{ .doom_key = KEY_MINUS, .shared_alias = .none, .source = .none },
+        'a' => .{ .doom_key = KEY_STRAFE_L, .shared_alias = .none, .source = .none },
+        'd' => .{ .doom_key = KEY_STRAFE_R, .shared_alias = .none, .source = .none },
+        else => .{ .doom_key = std.ascii.toLower(@intCast(key.codepoint)), .shared_alias = .none, .source = .none },
+    };
+}
+
+fn queueDoomKey(pressed: bool, doom_key: u8) void {
     const key_data: u16 = (@as(u16, @intCast(@intFromBool(pressed))) << 8) | doom_key;
     state.key_queue[state.key_queue_write_idx] = key_data;
     state.key_queue_write_idx +%= 1;

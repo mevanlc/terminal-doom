@@ -3,3 +3,7 @@ zig-out
 .DS_Store
 src/.savegame
 output.mp4
+/zig-pkg/
+/freedoom-*/
+*.log
+/.savegame/
