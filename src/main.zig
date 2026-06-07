@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-2-0 or MIT
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const zigimg = vaxis.zigimg;
 const Key = vaxis.Key;
@@ -11,6 +12,10 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     mouse: vaxis.Mouse,
 };
+
+fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
+    state.exit_flag.store(true, .seq_cst);
+}
 
 /// Game state
 const State = struct {
@@ -264,6 +269,17 @@ pub fn main(init: std.process.Init) !void {
         .loop = .init(io, &tty, &vx),
     };
 
+    const posix = std.posix;
+    var sigint_act = posix.Sigaction{
+        .handler = .{ .handler = sigintHandler },
+        .mask = switch (builtin.os.tag) {
+            .macos => 0,
+            else => posix.sigemptyset(),
+        },
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sigint_act, null);
+
     try state.loop.start();
     defer state.loop.stop();
 
@@ -423,7 +439,7 @@ fn mapSharedKey(key: vaxis.Key) SharedKeyMap {
         '-' => .{ .doom_key = KEY_MINUS, .shared_alias = .none, .source = .none },
         'a' => .{ .doom_key = KEY_STRAFE_L, .shared_alias = .none, .source = .none },
         'd' => .{ .doom_key = KEY_STRAFE_R, .shared_alias = .none, .source = .none },
-        else => .{ .doom_key = std.ascii.toLower(@intCast(key.codepoint)), .shared_alias = .none, .source = .none },
+        else => .{ .doom_key = if (key.codepoint <= std.math.maxInt(u8)) std.ascii.toLower(@intCast(key.codepoint)) else 0, .shared_alias = .none, .source = .none },
     };
 }
 
